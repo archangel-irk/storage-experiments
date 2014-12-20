@@ -1359,11 +1359,24 @@ function Document ( data, collectionName, schema, fields, init ){
     this.set( data, undefined, true );
   }
 
-  // apply methods
+  // m-gh-2439
+  // define getters for data.prop properties with non-strict schemas
+  if ( schema.options.strict === false && data ) {
+    var self = this
+      , keys = Object.keys( this._doc );
+
+    keys.forEach(function( key ) {
+      if (!(key in schema.tree)) {
+        define( self, key, null, self );
+      }
+    });
+  }
+
+  // Register methods
   for ( var m in schema.methods ){
     this[ m ] = schema.methods[ m ];
   }
-  // apply statics
+  // Register statics
   for ( var s in schema.statics ){
     this[ s ] = schema.statics[ s ];
   }
@@ -2527,7 +2540,14 @@ Document.prototype.$__handleSave = function(){
 
   if ( this.isNew ) {
     // send entire doc
-    var obj = this.toObject({ depopulate: 1 });
+
+    var toObjectOptions = {};
+    if ( this.schema.options.toObject && this.schema.options.toObject.retainKeyOrder ) {
+      toObjectOptions.retainKeyOrder = true;
+    }
+
+    toObjectOptions.depopulate = 1;
+    var obj = this.toObject( toObjectOptions );
 
     if ( ( obj || {} ).hasOwnProperty('_id') === false ) {
       // documents must have an _id else mongoose won't know
@@ -2539,10 +2559,9 @@ Document.prototype.$__handleSave = function(){
       return innerPromise;
     }
 
-    // Проверка на окружение тестов
-    // Хотя можно таким образом просто делать валидацию, даже если нет коллекции или api
+    // Без ресурса можно просто делать валидацию (подготовить данные к отправке), даже если нет коллекции
     if ( !resource ){
-      innerPromise.resolve( this );
+      innerPromise.resolve( obj );
     } else {
       resource.create( obj ).always( innerPromise.resolve );
     }
@@ -2562,10 +2581,9 @@ Document.prototype.$__handleSave = function(){
 
     if ( !_.isEmpty( delta ) ) {
       this.$__reset();
-      // Проверка на окружение тестов
-      // Хотя можно таким образом просто делать валидацию, даже если нет коллекции или api
+      // Без ресурса можно просто делать валидацию (подготовить данные к отправке), даже если нет коллекции
       if ( !resource ){
-        innerPromise.resolve( this );
+        innerPromise.resolve( delta );
       } else {
         resource( this.id ).update( delta ).always( innerPromise.resolve );
       }
@@ -2583,6 +2601,17 @@ Document.prototype.$__handleSave = function(){
 /**
  * @description Saves this document.
  *
+ * Если апи-клиента нет и документ новый, то в колбэке будет plain object со всеми данными для сохранения на сервер.
+ * Если апи-клиента нет и документ старое, то в колбэке будет plain object только с изменёнными данными.
+ *
+ * Если апи-клиент есть и не важно новый документ или старый, в колбэке всегда будет ответ от rest-api-client
+ *
+ * // todo: доописать это дело
+ * Сейчас если есть ресурс (апи клиент), то:
+ * если документ новый, то после ответа создастся новый документ на основе ответа, и обовляется!!! (получше объяснить это) ссылка (id) внутри коллекции
+ * если документ старый, то после ответа ищется этот документ по id и делается set
+ *
+ *
  * @example:
  *
  *     product.sold = Date.now();
@@ -2594,26 +2623,43 @@ Document.prototype.$__handleSave = function(){
  *
  * The `fn` callback is optional. If no `fn` is passed and validation fails, the validation error will be emitted on the connection used to create this model.
  * @example:
- *     var db = mongoose.createConnection(..);
  *     var schema = new Schema(..);
- *     var Product = db.model('Product', schema);
+ *     var Product = storage.createCollection('Product', schema );
+ *     var doc = Product.add();
  *
- *     db.on('error', handleError);
- *
- * @description However, if you desire more local error handling you can add an `error` listener to the model and handle errors there instead.
- * @example:
- *     Product.on('error', handleError);
+ *     // todo: реализовать это
+ *     doc.on('error', handleError);
  *
  * @description As an extra measure of flow control, save will return a Promise (bound to `fn` if passed) so it could be chained, or hook to recive errors
  * @example:
- *     product.save().then(function (product, numberAffected) {
+ *     product.save().done(function( product ){
  *        ...
- *     }).onRejected(function (err) {
- *        assert.ok(err)
+ *     }).fail(function( err ){
+ *        assert.ok( err )
  *     })
  *
- * @param {function(err, product, Number)} [done] optional callback
- * @return {Promise} Promise
+ * @description retainKeyOrder - keep the key order of the doc save
+ * @example:
+ *     var Checkin = new Schema({
+ *       date: Date,
+ *       location: {
+ *         lat: Number,
+ *         lng: Number
+ *       }
+ *     }, {
+ *       toObject: {
+ *         retainKeyOrder: true
+ *       }
+ *     });
+ *     var Checkins = storage.createCollection('Product', schema );
+ *     var doc = Checkins.add();
+ *
+ *     doc.save().done(function( objToSave ){
+ *       // in `objToSave` followed the correct order of the keys of doc
+ *     });
+ *
+ * @param {function( object )} [done] optional callback, object - objToSave
+ * @return {Deferred} Deferred
  * @api public
  * @see middleware http://mongoosejs.com/docs/middleware.html
  */
@@ -2657,19 +2703,27 @@ Document.prototype.save = function ( done ) {
   // Так мы передаём массив promise условий
   var p1 = Deferred.when.apply( Deferred, whenCond );
 
+  p1.fail(function ( err ) {
+    // If the initial insert fails provide a second chance.
+    // (If we did this all the time we would break updates)
+    if (self.$__.inserting) {
+      self.isNew = true;
+      self.emit('isNew', true);
+    }
+    finalPromise.reject( err );
+  });
+
   // Handle save and results
-  p1.then( this.$__handleSave.bind( this ) )
-    .then(function(){
-      return finalPromise.resolve( self );
-    }, function ( err ) {
-      // If the initial insert fails provide a second chance.
-      // (If we did this all the time we would break updates)
-      if (self.$__.inserting) {
-        self.isNew = true;
-        self.emit('isNew', true);
-      }
-      finalPromise.reject( err );
+  p1.done(function(){
+    self.$__handleSave().done(function(){
+      //todo: надо проверять, нужно ли писать проверку на наличие ресурса, если он есть - отдавать self, если нет, отдавать как сейчас написано
+      // возможно и скорее всего, api и так отдаёт всё в правильном порядке (doc, meta, jqxhr)
+      finalPromise.resolve.apply( finalPromise, arguments );
+
+    }).fail(function(){
+      finalPromise.reject.apply( finalPromise, arguments );
     });
+  });
 
   return finalPromise;
 };
@@ -2784,6 +2838,34 @@ Document.prototype.save = function ( done ) {
  * See [schema options](/docs/guide.html#toObject) for some more details.
  *
  * _During save, no custom options are applied to the document before being sent to the database._
+ *
+ * retainKeyOrder - keep the key order of the doc save
+ *
+ *     var Checkin = new Schema({ ... }, {
+ *       toObject: {
+ *         retainKeyOrder: true
+ *       }
+ *     });
+ *
+ *     doc.toObject(); // object with correct order of the keys of doc
+ *
+ *     // or inline
+ *
+ *     doc.toObject({ retainKeyOrder: true });
+ *
+ *     // or if use toJSON();
+ *
+ *     var Checkin = new Schema({ ... }, {
+ *       toJSON: {
+ *         retainKeyOrder: true
+ *       }
+ *     });
+ *
+ *     doc.toJSON(); // JSON string with correct order of the keys of doc
+ *
+ *     // or inline
+ *
+ *     doc.toJSON({ retainKeyOrder: true });
  *
  * @param {Object} [options]
  * @return {Object} js object
@@ -2955,7 +3037,7 @@ Document.prototype.toJSON = function (options) {
   }
   options.json = true;
 
-  return this.toObject(options);
+  return this.toObject( options );
 };
 
 /**
@@ -2970,14 +3052,14 @@ Document.prototype.toJSON = function (options) {
  * @api public
  */
 
-Document.prototype.equals = function (doc) {
+Document.prototype.equals = function( doc ){
   var tid = this.get('_id');
   var docid = doc.get('_id');
   if (!tid && !docid) {
     return deepEqual(this, doc);
   }
   return tid && tid.equals
-    ? tid.equals(docid)
+    ? (docid ? tid.equals(docid) : false)
     : tid === docid;
 };
 
@@ -2997,7 +3079,7 @@ Document.prototype.equals = function (doc) {
  * @return {Array|ObjectId|Number|Buffer|String|undefined}
  * @api public
  */
-Document.prototype.populated = function (path, val, options) {
+Document.prototype.populated = function( path, val, options ){
   // val and options are internal
 
   //TODO: доделать эту проверку, она должна опираться не на $__.populated, а на то, что наш объект имеет родителя
@@ -3573,7 +3655,7 @@ module.exports = Events;
 
 /*!
  * Storage documents using schema
- * inspired by mongoose 3.8.4 (fixed bugs for 3.8.16)
+ * inspired by mongoose 3.8.4 (fixed bugs for 3.8.19)
  *
  * Storage implementation
  * http://docs.meteor.com/#selectors
@@ -4074,7 +4156,6 @@ var Events = require('./events')
  *
  * ####Options:
  *
- * - [collection](/docs/guide.html#collection): string - no default
  * - [id](/docs/guide.html#id): bool - defaults to true
  * - `minimize`: bool - controls [document#toObject](#document_Document-toObject) behavior when called manually - defaults to true
  * - [strict](/docs/guide.html#strict): bool - defaults to true
@@ -4114,8 +4195,11 @@ function Schema ( name, baseSchema, obj, options ) {
     baseSchema = undefined;
   }
 
+  //todo: зачем оно нужно? проблема: obj становится как у прошлой схемы + текущее, из-за этого source,
+  // потому что оно копируется из старой схемы в текущий source, а так как он ссылается на obj,
+  // и в js у нас разделение памяти, то obj расширяется полями source из старой схемы.
   // Сохраним описание схемы для поддержки дискриминаторов
-  this.source = obj;
+  //this.source = obj;
 
   this.paths = {};
   this.subpaths = {};
@@ -4140,8 +4224,12 @@ function Schema ( name, baseSchema, obj, options ) {
     this.add( obj );
   }
 
+  // check if _id's value is a subdocument (m-gh-2276)
+  var _idSubDoc = obj && obj._id && _.isObject( obj._id );
+
   // ensure the documents get an auto _id unless disabled
-  var auto_id = !this.paths['_id'] && (!this.options.noId && this.options._id);
+  var auto_id = !this.paths['_id'] && (!this.options.noId && this.options._id) && !_idSubDoc;
+
   if (auto_id) {
     this.add({ _id: {type: Schema.ObjectId, auto: true} });
   }
@@ -4272,7 +4360,7 @@ Schema.prototype.add = function add ( obj, prefix ) {
  *
  * Keys in this object are names that are rejected in schema declarations b/c they conflict with mongoose functionality. Using these key name will throw an error.
  *
- *      on, emit, _events, db, get, set, init, isNew, errors, schema, options, modelName, collection, _pres, _posts, toObject
+ *      on, emit, _events, db, get, set, init, isNew, errors, schema, options, _pres, _posts, toObject
  *
  * _NOTE:_ Use of these terms as method names is permitted, but play at your own risk, as they may be existing mongoose document methods you are stomping on.
  *
@@ -4282,7 +4370,6 @@ Schema.prototype.add = function add ( obj, prefix ) {
 Schema.reserved = Object.create( null );
 var reserved = Schema.reserved;
 reserved.on =
-reserved.db =
 reserved.get =
 reserved.set =
 reserved.init =
@@ -4290,13 +4377,10 @@ reserved.isNew =
 reserved.errors =
 reserved.schema =
 reserved.options =
-reserved.modelName =
-reserved.collection =
 reserved.toObject =
-reserved.domain =
-reserved.emit =    // EventEmitter
-reserved._events = // EventEmitter
-reserved._pres = reserved._posts = 1; // hooks.js
+reserved.trigger =    // Events
+reserved.off =    // Events
+reserved._events = // Events
 
 /**
  * Gets/sets schema paths.
@@ -4314,7 +4398,7 @@ reserved._pres = reserved._posts = 1; // hooks.js
  * @api public
  */
 Schema.prototype.path = function (path, obj) {
-  if (obj == undefined) {
+  if (obj === undefined) {
     if (this.paths[path]) return this.paths[path];
     if (this.subpaths[path]) return this.subpaths[path];
 
@@ -4750,8 +4834,8 @@ Schema.prototype.virtualpath = function (name) {
 Schema.discriminators;
 
 /**
- * Наследование от схемы.
- * this - базовая схема!!!
+ * Schema inheritance
+ * this - baseSchema
  *
  * ####Example:
  *     var PersonSchema = new Schema('Person', {
@@ -4788,10 +4872,6 @@ Schema.prototype.discriminator = function discriminator (name, schema) {
     schema.add(obj);
     schema.discriminatorMapping = { key: key, value: name, isRoot: false };
 
-    if (baseSchema.options.collection) {
-      schema.options.collection = baseSchema.options.collection;
-    }
-
       // throws error if options are invalid
     (function validateOptions(a, b) {
       a = utils.clone(a);
@@ -4802,7 +4882,7 @@ Schema.prototype.discriminator = function discriminator (name, schema) {
       delete b.toObject;
 
       if (!utils.deepEqual(a, b)) {
-        throw new Error("Discriminator options are not customizable (except toJSON & toObject)");
+        throw new Error('Discriminator options are not customizable (except toJSON & toObject)');
       }
     })(schema.options, baseSchema.options);
 
@@ -4830,6 +4910,16 @@ Schema.prototype.discriminator = function discriminator (name, schema) {
   }
 
   this.discriminators[name] = schema;
+
+  // Register methods and statics
+  for ( var m in this.methods ){
+    schema.methods[ m ] = this.methods[ m ];
+  }
+  for ( var s in this.statics ){
+    schema.statics[ s ] = this.methods[ s ];
+  }
+
+  return this.discriminators[name];
 };
 
 /*!
@@ -7071,7 +7161,13 @@ StorageArray.mixin = {
         value = { _id: value };
       }
 
-      value = new Model(value);
+      // gh-2399
+      // we should cast model only when it's not a discriminator
+      var isDisc = value.schema && value.schema.discriminatorMapping &&
+        value.schema.discriminatorMapping.key !== undefined;
+      if (!isDisc) {
+        value = new Model(value);
+      }
       return this._schema.caster.cast(value, this._parent, true);
     }
 
@@ -8633,10 +8729,12 @@ exports.merge = function merge (to, from) {
 
   while (i--) {
     key = keys[i];
-    if ('undefined' === typeof to[key]) {
+
+    if ( typeof to[key] === 'undefined' ){
       to[key] = from[key];
-    } else if ( _.isObject(from[key]) ) {
-      merge(to[key], from[key]);
+
+    } else if ( _.isObject( from[key] ) ){
+      merge( to[key], from[key] );
     }
   }
 };
@@ -9218,7 +9316,7 @@ function base64Write (buf, string, offset, length) {
 }
 
 function utf16leWrite (buf, string, offset, length) {
-  var charsWritten = blitBuffer(utf16leToBytes(string), buf, offset, length)
+  var charsWritten = blitBuffer(utf16leToBytes(string), buf, offset, length, 2)
   return charsWritten
 }
 
@@ -9902,7 +10000,8 @@ function base64ToBytes (str) {
   return base64.toByteArray(str)
 }
 
-function blitBuffer (src, dst, offset, length) {
+function blitBuffer (src, dst, offset, length, unitSize) {
+  if (unitSize) length -= length % unitSize;
   for (var i = 0; i < length; i++) {
     if ((i + offset >= dst.length) || (i >= src.length))
       break
@@ -10252,15 +10351,15 @@ process.chdir = function (dir) {
 
 },{}],42:[function(require,module,exports){
 module.exports={
-  "name": "storage-experiments",
-  "version": "0.1.0-alpha",
-  "description": "storage.js - experiments",
+  "name": "storage",
+  "version": "0.3.0",
+  "description": "Mongoose-like schema validation, collections and documents on browser (client-side)",
   "author": "Constantine Melnikov <ka.melnikov@gmail.com>",
-  "maintainers": "Constantine Melnikov <ka.melnikov@gmail.com>",
   "repository": {
     "type": "git",
-    "url": "https://github.com/archangel-irk/storage-experiments.git"
+    "url": "https://github.com/archangel-irk/storage.git"
   },
+  "main": "dist/storage.min.js",
   "scripts": {
     "test": "grunt test"
   },
@@ -10284,7 +10383,14 @@ module.exports={
     "karma-safari-launcher": "latest",
     "karma-sauce-launcher": "latest",
 
-    "browserify": "latest"
+    "lodash": "latest",
+
+    "browserify": "latest",
+
+    "dox": "latest",
+    "highlight.js": "latest",
+    "jade": "latest",
+    "markdown": "latest"
   }
 }
 
